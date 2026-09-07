@@ -1517,6 +1517,32 @@ def _adjust_config(config: EngineConfig):
                 "max_position_embeddings in config.json instead."
             )
 
+    if config.kv_cache_dtype != "auto":
+        from freetoken.attention import SUPPORTED_ATTENTION_BACKENDS
+
+        primary = config.attention_backend.split(",")[0]
+        info = SUPPORTED_ATTENTION_BACKENDS.info(primary)
+        if not getattr(info, "supports_fp8_kv", False):
+            raise ValueError(
+                f"--kv-cache-dtype {config.kv_cache_dtype} needs an attention backend that "
+                f"passes per-tensor KV scales to its kernel; {primary!r} does not. Pass "
+                "--attention-backend fi, or drop --kv-cache-dtype. (Deliberately NOT "
+                "auto-switching the backend: quantized KV on a slower attention backend is a "
+                "net loss on this hardware.)"
+            )
+        # flashinfer restricts one-byte KV to sm_100+ when head_dim > 256
+        # (jit/attention/modules.py:_fa2_head_dim_nvcc_flags); at or below 256 every arch is
+        # allowed. Fail here rather than inside a JIT compile.
+        head_dim = int(config.model_config.head_dim)
+        if head_dim > 256 and torch.cuda.is_available():
+            major = torch.cuda.get_device_capability()[0]
+            if major < 10:
+                raise ValueError(
+                    f"--kv-cache-dtype {config.kv_cache_dtype} needs head_dim <= 256 on "
+                    f"sm_{major}x; this model has head_dim {head_dim}. flashinfer only "
+                    "compiles one-byte KV at head_dim > 256 for sm_100+."
+                )
+
     # The startup ServerArgs dump is the *requested* config, printed in the frontend process
     # before any of the resolution above ran -- so "moe_backend='auto'" is all it can say. This
     # is the one line that reports what actually runs, for every path (explicit backends never
@@ -1525,6 +1551,7 @@ def _adjust_config(config: EngineConfig):
         f"attention_backend={config.attention_backend!r}",
         f"cache_type={getattr(config, 'cache_type', 'radix')!r}",
         f"page_size={config.page_size}",
+        f"kv_cache_dtype={config.kv_cache_dtype!r}",
     ]
     if is_moe:
         resolved.insert(0, f"moe_backend={config.moe_backend!r}")

@@ -33,6 +33,11 @@ class BackendInfo:
     # Whether forward() honors a per-call AttentionSpec (window/sm_scale/sinks).
     # Non-consumers raise on a non-None spec instead of silently dropping it.
     consumes_attn_spec: bool = False
+    # Whether forward() passes the KV pool's per-tensor (k_scale, v_scale) to its kernel, so
+    # the pool may be allocated at fp8. Backends that do NOT set this would read quantized
+    # bytes as if they were bf16; --kv-cache-dtype fp8_e4m3 is rejected against them at
+    # config time rather than silently switching the engine to a backend that does.
+    supports_fp8_kv: bool = False
 
 
 SUPPORTED_ATTENTION_BACKENDS = Registry[BackendCreator]("Attention Backend")
@@ -58,6 +63,7 @@ def create_trtllm_backend(config: ModelConfig):
     BackendInfo(
         supported_types=frozenset({AttnType.FULL}),
         requires_flashinfer=True,
+        supports_fp8_kv=True,
     ),
 )
 def create_fi_backend(config: ModelConfig):
