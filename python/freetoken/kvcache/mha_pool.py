@@ -33,7 +33,7 @@ class MHAKVCache(BaseKVCachePool):
         dtype: torch.dtype,
         device: torch.device,
         layer_ids: Sequence[int] | None = None,
-        kv_scales: "KVScaleTable | None" = None,
+        kv_scales: KVScaleTable | None = None,
         compute_dtype: torch.dtype | None = None,
     ) -> None:
         tp_info = get_tp_info()
@@ -190,7 +190,7 @@ class MHAKVCache(BaseKVCachePool):
         return self._kv_scales.get(layer_id)
 
     @property
-    def kv_scales(self) -> "KVScaleTable | None":
+    def kv_scales(self) -> KVScaleTable | None:
         return self._kv_scales
 
     def set_checkpoint_scales(self, scales: dict[int, tuple[float, float]]) -> None:
