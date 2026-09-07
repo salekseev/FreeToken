@@ -135,9 +135,15 @@ def _rename(raw_name: str) -> str | None:
     """HF key -> FreeToken state-dict key, or None to skip."""
     if raw_name.startswith(("mtp.", "model.visual.", "visual.")):
         return None
-    # ModelOpt FP8 KV-cache static scales (full-attention layers only). FreeToken keeps the
-    # KV cache in the engine's native precision (>= the checkpoint's quantized KV), so these
-    # per-tensor q/k/v scales are unused -- drop them rather than fail as unexpected keys.
+    # ModelOpt FP8 KV-cache static scales (full-attention layers only). Dropped HERE on
+    # purpose: _rename is a pure str -> str | None with nowhere to write a tensor, and it has
+    # seven call sites. When --kv-cache-dtype fp8_e4m3 is on, kvcache/kv_scale.py's
+    # read_checkpoint_kv_scales() reads .k_scale/.v_scale straight out of the checkpoint's
+    # safetensors instead, keyed by global layer id. So these keys are still unused by the
+    # LOADER, but they are no longer unused by the engine -- do not delete them from the
+    # checkpoint on the assumption that nothing reads them.
+    # (.q_scale and .prob_scale really are unused: they scale the query and the softmax
+    # probabilities, not the KV cache.)
     if raw_name.endswith((".k_scale", ".v_scale", ".q_scale", ".prob_scale")):
         return None
     name = raw_name
