@@ -135,6 +135,12 @@ class MHAKVCache(BaseKVCachePool):
         from freetoken.kernel import store_cache
 
         dense = self._dense(layer_id)
+        if self._kv_scales is not None:
+            # First store for this layer freezes its scale. store_cache is a raw byte copy,
+            # so k/v must already be fp8 with rows matching the slab's element_size.
+            k_scale, v_scale = self._kv_scales.ensure(layer_id, k, v)
+            k = self._to_fp8(k, k_scale)
+            v = self._to_fp8(v, v_scale)
         store_cache(
             k_cache=self._k_buffer[dense].view(self._storage_shape),
             v_cache=self._v_buffer[dense].view(self._storage_shape),
@@ -142,6 +148,20 @@ class MHAKVCache(BaseKVCachePool):
             k=k,
             v=v,
         )
+
+    def _to_fp8(self, t: torch.Tensor, scale: float) -> torch.Tensor:
+        """Scale-and-cast to e4m3, tallying saturated elements without a host sync.
+
+        Non-in-place div/clamp deliberately: ``t.detach().float()`` shares storage (it is not
+        a copy) whenever ``t`` is already float32, so in-place ops here would silently mutate
+        the CALLER's k/v tensor. Today's engine runs bf16, where ``.float()`` does copy, so
+        this is latent rather than live -- but it costs one allocation on a path the roofline
+        does not care about, and a caller that passes fp32 would otherwise be corrupted with
+        no symptom at the call site. Do not "simplify" this back to div_/clamp_.
+        """
+        scaled = t.detach().float().div(scale)
+        self._clamp_count += (scaled.abs() > FP8_E4M3_MAX).sum()
+        return scaled.clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX).to(torch.float8_e4m3fn)
 
     @property
     def device(self) -> torch.device:
