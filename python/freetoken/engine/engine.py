@@ -355,11 +355,17 @@ class Engine:
         self.ctx.kv_cache = self.kv_cache = create_kv_pool(
             config, self.num_pages, device=self.device, dtype=self.dtype
         )
-        if config.kv_cache_dtype != "auto":
+        # Ask the POOL which layers hold paged KV rather than re-deriving it from the specs.
+        # The pool already resolved that when it built the table, and it has a fallback for
+        # models with no layer remap (`tuple(range(num_layers))`). Re-deriving it here meant
+        # two seams disagreeing: this one used an empty-tuple fallback, so on a model whose
+        # spec carries no layer_ids the reader was handed (), returned {}, and the checkpoint
+        # path went silently dead while the log cheerfully read "0/0 layers".
+        kv_scales = getattr(self.kv_cache, "kv_scales", None)
+        if kv_scales is not None:
             from freetoken.kvcache.kv_scale import read_checkpoint_kv_scales
 
-            kv_specs = [s for s in config.model_config.kv_cache_group_specs() if s.num_layers > 0]
-            layer_ids = kv_specs[0].layer_ids if kv_specs and kv_specs[0].layer_ids else ()
+            layer_ids = sorted(kv_scales.layer_ids)
             ckpt = read_checkpoint_kv_scales(config.model_path, layer_ids)
             self.kv_cache.set_checkpoint_scales(ckpt)
             logger.info_rank0(
