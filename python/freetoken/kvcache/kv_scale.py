@@ -139,3 +139,113 @@ class KVScaleTable:
     def _amax(t: torch.Tensor) -> float:
         # One host sync per layer, once, during calibration. Never on the steady-state path.
         return float(t.detach().float().abs().amax().item())
+
+
+_KV_SCALE_SUFFIX = {".k_scale": "k", ".v_scale": "v"}
+
+
+def _kv_scale_layer_id(key: str) -> tuple[int, str] | None:
+    """``...layers.<N>...(.k_scale|.v_scale)`` -> ``(N, 'k'|'v')``, else None.
+
+    ``.q_scale`` and ``.prob_scale`` are deliberately excluded: they scale the query and the
+    softmax probabilities, not the KV cache, and folding them into the KV scale would be wrong.
+    """
+    for suffix, which in _KV_SCALE_SUFFIX.items():
+        if not key.endswith(suffix):
+            continue
+        parts = key.split(".")
+        for i, part in enumerate(parts):
+            if part == "layers" and i + 1 < len(parts) and parts[i + 1].isdigit():
+                return int(parts[i + 1]), which
+        return None
+    return None
+
+
+def read_checkpoint_kv_scales(
+    model_path: str, layer_ids: "tuple[int, ...] | list[int]"
+) -> dict[int, tuple[float, float]]:
+    """Read per-layer ModelOpt fp8 KV scales straight from the checkpoint's safetensors.
+
+    Returns ``{global_layer_id: (k_scale, v_scale)}`` for the layers that ship BOTH, keyed by
+    the SAME global ids the pool's store path and ``KVScaleTable`` use. ``layer_ids`` is the
+    set of layers that actually hold paged KV; a scale on any other layer is ignored. Layers
+    missing either half are omitted, and calibration covers them.
+
+    Deliberately NOT remapped to a dense 0..N index. The store path calls
+    ``KVScaleTable.ensure(layer_id, ...)`` with the global id, so a dense-keyed mapping here
+    would install checkpoint scales under keys nothing ever looks up -- silently dead, with
+    calibration quietly taking over and ``all_frozen()`` still reporting success.
+
+    Deliberately independent of the weight loader. ``models/qwen3_5_moe/weight.py:_rename``
+    drops these keys, and routing them through it would mean touching all seven of its call
+    sites; it is a pure ``str -> str | None`` with nowhere to write them. Reading the
+    checkpoint directly also keeps this function unit-testable with no GPU and no engine.
+
+    This runs on the engine boot path, so a malformed checkpoint raises ``ValueError`` naming
+    the offending file or shard -- never a bare ``JSONDecodeError``/``KeyError``/
+    ``FileNotFoundError`` that leaves whoever is starting the server without a lead. A scale
+    tensor that is not a single element is refused for the same reason ``KVScaleTable`` refuses
+    a non-finite one: silently taking element 0 of a per-head or per-channel scale would freeze
+    a wrong value into the table for the life of the process, with every token in that layer
+    decoded against it afterward.
+    """
+    import json
+    import os
+
+    from safetensors import safe_open
+
+    valid = frozenset(int(i) for i in layer_ids)
+
+    index_path = os.path.join(model_path, "model.safetensors.index.json")
+    if os.path.isfile(index_path):
+        source = index_path
+        with open(index_path) as fh:
+            try:
+                index = json.load(fh)
+            except json.JSONDecodeError as err:
+                raise ValueError(f"{index_path} is not valid JSON: {err}") from err
+        if "weight_map" not in index:
+            raise ValueError(f"{index_path} has no 'weight_map' key")
+        weight_map: dict[str, str] = index["weight_map"]
+    else:
+        single = os.path.join(model_path, "model.safetensors")
+        if not os.path.isfile(single):
+            return {}
+        source = single
+        with safe_open(single, framework="pt") as fh:
+            weight_map = {key: "model.safetensors" for key in fh.keys()}
+
+    # shard -> {(layer_id, which): key}, so each shard is opened at most once.
+    wanted: dict[str, dict[tuple[int, str], str]] = {}
+    for key, shard in weight_map.items():
+        parsed = _kv_scale_layer_id(key)
+        if parsed is None:
+            continue
+        global_id, which = parsed
+        if global_id not in valid:
+            continue  # a scale on a layer that holds no paged KV; not ours to use
+        wanted.setdefault(shard, {})[(global_id, which)] = key
+
+    found: dict[tuple[int, str], float] = {}
+    for shard, entries in wanted.items():
+        shard_path = os.path.join(model_path, shard)
+        if not os.path.isfile(shard_path):
+            raise ValueError(
+                f"weight_map in {source} references shard {shard!r}, which is missing from "
+                f"{model_path}"
+            )
+        with safe_open(shard_path, framework="pt") as fh:
+            for (layer_id, which), key in entries.items():
+                tensor = fh.get_tensor(key)
+                if tensor.numel() != 1:
+                    raise ValueError(
+                        f"{key} (layer {layer_id}) is not a per-tensor scale: shape "
+                        f"{tuple(tensor.shape)} has {tensor.numel()} elements"
+                    )
+                found[(layer_id, which)] = float(tensor.reshape(-1)[0].item())
+
+    return {
+        layer_id: (found[(layer_id, "k")], found[(layer_id, "v")])
+        for layer_id in sorted({lid for lid, _ in found})
+        if (layer_id, "k") in found and (layer_id, "v") in found
+    }
