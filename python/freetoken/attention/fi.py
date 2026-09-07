@@ -169,7 +169,11 @@ class FlashInferBackend(BaseAttnBackend):
                 page_size=metadata.page_size,
                 pos_encoding_mode=metadata.pos_encoding_mode,
                 seq_lens=metadata.seq_lens_cpu,
-                data_type=kv_dtype,
+                # `data_type` is inert here: flashinfer only falls back to it for whichever
+                # of q_data_type/kv_data_type is None (decode.py:1123-1129), and both are
+                # given. Left at the compute dtype so it does not read as a claim about the
+                # slabs. o_data_type defaults to q_data_type, i.e. bf16 output. Correct.
+                data_type=metadata.dtype,
                 q_data_type=metadata.dtype,
                 kv_data_type=kv_dtype,
                 non_blocking=True,
@@ -269,7 +273,10 @@ class FlashInferBackend(BaseAttnBackend):
             page_size=1,
             pos_encoding_mode="NONE",
             seq_lens_cpu=seq_len_cpu,
-            dtype=self.kvcache.dtype,
+            # COMPUTE dtype, not the slab dtype: this feeds q_data_type at plan time,
+            # and q is bf16 even when the KV slabs are fp8. flashinfer hard-raises on a
+            # q dtype that disagrees with what plan() declared.
+            dtype=self.kvcache.compute_dtype,
             wrapper=self.decode_wrappers if batch.is_decode else self.prefill_wrapper,
         )
 

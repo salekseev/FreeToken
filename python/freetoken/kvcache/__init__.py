@@ -288,6 +288,9 @@ def create_kvcache_pool(
         head_dim=spec.head_dim if spec is not None else model_config.head_dim,
         device=device,
         dtype=kv_dtype,
+        # `dtype` is the slab dtype; the engine's compute dtype is a separate axis once the
+        # two can differ, and the attention backend needs both.
+        compute_dtype=dtype,
         layer_ids=layer_ids,
         # Declared over the GLOBAL ids of the layers that hold paged KV (10 of 40 here) --
         # the same ids store_kv and the attention backend pass in. all_frozen() checks that

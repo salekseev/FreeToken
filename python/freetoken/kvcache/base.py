@@ -166,6 +166,16 @@ class BaseKVCachePool(ABC):
     def dtype(self) -> torch.dtype: ...
 
     @property
+    def compute_dtype(self) -> torch.dtype:
+        """The engine's COMPUTE dtype, which is what q and the attention output use.
+
+        Equals ``dtype`` for every unquantized pool. When the KV slabs are quantized
+        (``--kv-cache-dtype fp8_e4m3``), ``dtype`` becomes the STORAGE dtype and the two
+        diverge -- an attention backend must declare q at ``compute_dtype`` and the paged
+        cache at ``dtype``, or flashinfer rejects the mismatch at run time."""
+        return self.dtype
+
+    @property
     @abstractmethod
     def num_layers(self) -> int: ...
 

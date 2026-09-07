@@ -34,6 +34,7 @@ class MHAKVCache(BaseKVCachePool):
         device: torch.device,
         layer_ids: Sequence[int] | None = None,
         kv_scales: "KVScaleTable | None" = None,
+        compute_dtype: torch.dtype | None = None,
     ) -> None:
         tp_info = get_tp_info()
         local_kv_heads = div_even(num_kv_heads, tp_info.size, allow_replicate=True)
@@ -61,6 +62,9 @@ class MHAKVCache(BaseKVCachePool):
         # None restores the unquantized path exactly. When present, store_kv scales-and-casts
         # into the fp8 slabs and the attention backend passes the same scalars to flashinfer.
         self._kv_scales = kv_scales
+        # `dtype` above is the SLAB dtype, which is fp8 when the pool is quantized.
+        # The attention backend still needs the compute dtype for q and the output.
+        self._compute_dtype = compute_dtype if compute_dtype is not None else dtype
         # Device-side clamp tally. Accumulated without a sync so the steady-state store path
         # stays free of host round-trips; read only by the reporting path.
         self._clamp_count = torch.zeros((), dtype=torch.int64, device=device)
@@ -170,6 +174,10 @@ class MHAKVCache(BaseKVCachePool):
     @property
     def dtype(self) -> torch.dtype:
         return self._kv_buffer.dtype
+
+    @property
+    def compute_dtype(self) -> torch.dtype:
+        return self._compute_dtype
 
     @property
     def num_layers(self) -> int:
