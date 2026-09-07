@@ -76,6 +76,24 @@ def resolve_pool_class(model_config: ModelConfig) -> type[BaseKVCachePool]:
     return MHAKVCache
 
 
+def _reject_fp8_kv(
+    kv_dtype: torch.dtype, dtype: torch.dtype, model_config: ModelConfig
+) -> None:
+    """Refuse a quantized KV slab on any pool family but the MHA paged pool.
+
+    MHAKVCache is the only family that scales-and-casts in ``store_kv`` and carries a
+    ``KVScaleTable``; the others would allocate one-byte slabs and then read them back as
+    if they held the compute dtype. Called from inside each family's own branch rather
+    than hoisted to the top, so a branch that raises for its own reasons first (QSA's
+    missing ``num_req_slots``) keeps reporting that instead of this.
+    """
+    if kv_dtype != dtype:
+        raise ValueError(
+            "--kv-cache-dtype fp8_e4m3 is only implemented for the MHA paged pool, not "
+            f"{resolve_pool_class(model_config).__name__}"
+        )
+
+
 def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dtype):
     """Build the engine's KV pool for ``num_pages`` USABLE pages (the dummy page and every
     secondary tier -- window pool, index slab, state rings -- are derived here or inside
@@ -89,11 +107,7 @@ def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dt
         # DSV4 is driven by the generic CacheManager over the shared page table; the pool is
         # the only DSV4-specific piece (the swa_pool plug-in: window tier + cmp/idx/state
         # shadows). Sizing reads dsv4_args, never the group spec.
-        if config.kv_dtype != dtype:
-            raise ValueError(
-                f"--kv-cache-dtype fp8_e4m3 is only implemented for the MHA paged pool, not "
-                f"{resolve_pool_class(model_config).__name__}"
-            )
+        _reject_fp8_kv(config.kv_dtype, dtype, model_config)
         pool = DSV4PagedKVCache(
             sizes=_dsv4_pool_sizes(config, num_pages + 1),  # +1 for dummy page
             args=model_config.dsv4_args,
@@ -185,11 +199,7 @@ def create_kvcache_pool(
 
         spec = kv_specs[0]
         assert layer_ids is None, "hybrid-linear x BSA has no pool support yet"
-        if kv_dtype != dtype:
-            raise ValueError(
-                f"--kv-cache-dtype fp8_e4m3 is only implemented for the MHA paged pool, not "
-                f"{resolve_pool_class(model_config).__name__}"
-            )
+        _reject_fp8_kv(kv_dtype, dtype, model_config)
         return BSAKVCache(
             num_kv_heads=spec.num_kv_heads,
             num_layers=model_config.num_layers,
@@ -212,11 +222,7 @@ def create_kvcache_pool(
         spec = kv_specs[0]
         if num_req_slots is None:
             raise ValueError("QSA pools need num_req_slots (max_running_req + 1)")
-        if kv_dtype != dtype:
-            raise ValueError(
-                f"--kv-cache-dtype fp8_e4m3 is only implemented for the MHA paged pool, not "
-                f"{resolve_pool_class(model_config).__name__}"
-            )
+        _reject_fp8_kv(kv_dtype, dtype, model_config)
         return QSAKVCache(
             num_kv_heads=spec.num_kv_heads,
             num_layers=model_config.num_layers,
@@ -235,11 +241,7 @@ def create_kvcache_pool(
     if len(kv_specs) == 1 and kv_specs[0].mla:
         from .dsa_pool import DSAKVCache, KpoolDSAKVCache, MLAKVCache
 
-        if kv_dtype != dtype:
-            raise ValueError(
-                f"--kv-cache-dtype fp8_e4m3 is only implemented for the MHA paged pool, not "
-                f"{resolve_pool_class(model_config).__name__}"
-            )
+        _reject_fp8_kv(kv_dtype, dtype, model_config)
         spec = kv_specs[0]
         # With a layer remap the pool allocates len(layer_ids) slabs; without one
         # it backs every model layer (all-MLA models, GLM-5.2).
