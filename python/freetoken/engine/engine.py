@@ -364,7 +364,7 @@ class Engine:
             self.kv_cache.set_checkpoint_scales(ckpt)
             logger.info_rank0(
                 f"fp8 KV cache: {len(ckpt)}/{len(layer_ids)} layers have checkpoint-calibrated "
-                f"scales; the rest calibrate at startup"
+                "scales; the rest calibrate at startup"
             )
 
         # ======================= Linear (GatedDeltaNet) state initialization ========================
@@ -1609,11 +1609,8 @@ def _adjust_config(config: EngineConfig):
             )
 
     if config.kv_cache_dtype != "auto":
-        from freetoken.attention import SUPPORTED_ATTENTION_BACKENDS
-
         primary = config.attention_backend.split(",")[0]
-        info = SUPPORTED_ATTENTION_BACKENDS.info(primary)
-        if not getattr(info, "supports_fp8_kv", False):
+        if not attention_backend_info(primary).supports_fp8_kv:
             raise ValueError(
                 f"--kv-cache-dtype {config.kv_cache_dtype} needs an attention backend that "
                 f"passes per-tensor KV scales to its kernel; {primary!r} does not. Pass "
