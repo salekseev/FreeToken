@@ -151,6 +151,10 @@ class FlashInferBackend(BaseAttnBackend):
         from flashinfer import BatchDecodeWithPagedKVCacheWrapper
 
         metadata.initialized = True
+        # The KV slabs may be fp8 while q stays bf16. flashinfer needs the STORAGE dtype at
+        # plan time to pick the right kernel; passing metadata.dtype for both would compile a
+        # bf16-KV kernel and then hand it fp8 bytes.
+        kv_dtype = self.kvcache.dtype
         # FlashInfer planning reuses a pinned host staging buffer and launches an
         # async H2D copy. Wait here before the next plan mutates that host buffer.
         self.last_event.synchronize()
@@ -165,9 +169,9 @@ class FlashInferBackend(BaseAttnBackend):
                 page_size=metadata.page_size,
                 pos_encoding_mode=metadata.pos_encoding_mode,
                 seq_lens=metadata.seq_lens_cpu,
-                data_type=metadata.dtype,
+                data_type=kv_dtype,
                 q_data_type=metadata.dtype,
-                kv_data_type=metadata.dtype,
+                kv_data_type=kv_dtype,
                 non_blocking=True,
             )
         else:
@@ -183,7 +187,7 @@ class FlashInferBackend(BaseAttnBackend):
                 pos_encoding_mode=metadata.pos_encoding_mode,
                 seq_lens=metadata.seq_lens_cpu,
                 q_data_type=metadata.dtype,
-                kv_data_type=metadata.dtype,
+                kv_data_type=kv_dtype,
                 non_blocking=True,
                 causal=True,
             )
@@ -220,7 +224,17 @@ class FlashInferBackend(BaseAttnBackend):
         self.kvcache.store_kv(k, v, batch.out_loc, layer_id)
         kv_cache = (self.kvcache.k_cache(layer_id), self.kvcache.v_cache(layer_id))
         kv_cache = (_flatten_cache(kv_cache[0]), _flatten_cache(kv_cache[1]))
-        return metadata.wrapper.run(q=q, paged_kv_cache=kv_cache)
+        # flashinfer does not dequantize in-kernel: it folds these scalars
+        # (sm_scale *= k_scale in prefill.py:1414 / decode.py:2051, out *= v_scale in
+        # prefill.py:1461), which is algebraically exact for a per-tensor scale. Scales are
+        # frozen before graph capture because k_scale becomes a captured kernel constant.
+        scales = getattr(self.kvcache, "kv_scale", lambda _: None)(layer_id)
+        if scales is None:
+            return metadata.wrapper.run(q=q, paged_kv_cache=kv_cache)
+        k_scale, v_scale = scales
+        return metadata.wrapper.run(
+            q=q, paged_kv_cache=kv_cache, k_scale=k_scale, v_scale=v_scale
+        )
 
     def prepare_metadata(self, batch: Batch) -> None:
         reqs = batch.padded_reqs
