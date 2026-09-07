@@ -232,7 +232,7 @@ class FlashInferBackend(BaseAttnBackend):
         # (sm_scale *= k_scale in prefill.py:1414 / decode.py:2051, out *= v_scale in
         # prefill.py:1461), which is algebraically exact for a per-tensor scale. Scales are
         # frozen before graph capture because k_scale becomes a captured kernel constant.
-        scales = getattr(self.kvcache, "kv_scale", lambda _: None)(layer_id)
+        scales = self.kvcache.kv_scale(layer_id)
         if scales is None:
             return metadata.wrapper.run(q=q, paged_kv_cache=kv_cache)
         k_scale, v_scale = scales

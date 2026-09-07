@@ -175,6 +175,14 @@ class BaseKVCachePool(ABC):
         cache at ``dtype``, or flashinfer rejects the mismatch at run time."""
         return self.dtype
 
+    def kv_scale(self, layer_id: int) -> tuple[float, float] | None:
+        """This layer's frozen per-tensor (k_scale, v_scale), or None when the slabs hold
+        the compute dtype and need no scaling.
+
+        Part of the base contract for the same reason ``compute_dtype`` is: the attention
+        backend asks every pool, and only the quantized MHA pool answers with a pair."""
+        return None
+
     @property
     @abstractmethod
     def num_layers(self) -> int: ...
