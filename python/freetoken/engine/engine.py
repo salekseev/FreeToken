@@ -355,6 +355,17 @@ class Engine:
         self.ctx.kv_cache = self.kv_cache = create_kv_pool(
             config, self.num_pages, device=self.device, dtype=self.dtype
         )
+        if config.kv_cache_dtype != "auto":
+            from freetoken.kvcache.kv_scale import read_checkpoint_kv_scales
+
+            kv_specs = [s for s in config.model_config.kv_cache_group_specs() if s.num_layers > 0]
+            layer_ids = kv_specs[0].layer_ids if kv_specs and kv_specs[0].layer_ids else ()
+            ckpt = read_checkpoint_kv_scales(config.model_path, layer_ids)
+            self.kv_cache.set_checkpoint_scales(ckpt)
+            logger.info_rank0(
+                f"fp8 KV cache: {len(ckpt)}/{len(layer_ids)} layers have checkpoint-calibrated "
+                f"scales; the rest calibrate at startup"
+            )
 
         # ======================= Linear (GatedDeltaNet) state initialization ========================
         linear_group = config.model_config.linear_attention_group()
@@ -414,6 +425,8 @@ class Engine:
         if self.linear_state_pool is not None:
             self.dummy_req.linear_slot_idx = self.linear_state_pool.padding_slot
         self.page_table[self.dummy_req.table_idx].fill_(num_tokens)  # point to dummy page
+        # MUST precede capture: see _calibrate_kv_scales.
+        self._calibrate_kv_scales(config)
         self.graph_runner = GraphRunner(
             stream=self.stream,
             device=self.device,
@@ -940,6 +953,84 @@ class Engine:
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)
         return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
+
+    def _calibrate_kv_scales(self, config: EngineConfig) -> None:
+        """Freeze every KV layer's fp8 scale BEFORE CUDA-graph capture.
+
+        A stored fp8 value has already been divided by its scale, so the scale cannot change
+        afterward without corrupting the pool -- and flashinfer folds k_scale into sm_scale,
+        which capture bakes in as a kernel constant. Capture itself runs forwards through
+        store_kv, so without this pass the scales would freeze on dummy activations.
+
+        Distinct from _warmup_prefill: that one only runs for the triton backend, runs after
+        capture, and feeds all-zero token ids (positions then differ only by RoPE, which
+        understates K's spread). This feeds varied ids.
+        """
+        table = getattr(self.kv_cache, "kv_scales", None)
+        if table is None:
+            return
+
+        length = min(128, self.max_seq_len)
+        if length < 2:
+            raise RuntimeError(
+                f"fp8 KV calibration needs at least 2 tokens, max_seq_len is {self.max_seq_len}"
+            )
+
+        dummy_row = self.page_table[self.dummy_req.table_idx]
+        dummy_slot = int(dummy_row[0].item())
+        vocab = int(config.model_config.vocab_size)
+        started, ended = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        started.record(self.stream)
+        try:
+            dummy_row[:length] = torch.arange(length, dtype=torch.int32, device=self.device)
+            # A large stride spreads the sampled embedding rows instead of repeating one token.
+            ids = (torch.arange(length, dtype=torch.int64, device=self.device) * 7919 + 13) % vocab
+            ids = ids.to(torch.int32)
+            calib_req = Req(
+                input_ids=ids.to("cpu"),
+                table_idx=self.dummy_req.table_idx,
+                cached_len=0,
+                output_len=1,
+                uid=-1,
+                sampling_params=None,  # type: ignore[arg-type]
+                cache_handle=None,  # type: ignore[arg-type]
+            )
+            batch = Batch(reqs=[calib_req], phase="prefill")
+            batch.padded_reqs = batch.reqs
+            batch.input_ids = ids
+            batch.positions = torch.arange(length, dtype=torch.int32, device=self.device)
+            batch.out_loc = dummy_row[:length]
+            self.attn_backend.prepare_metadata(batch)
+            with self.ctx.forward_batch(batch):
+                self.model.forward()
+        finally:
+            dummy_row.fill_(dummy_slot)
+            if self.moe_offload_cache is not None:
+                self.moe_offload_cache.reset()
+        ended.record(self.stream)
+        torch.cuda.synchronize(self.device)
+
+        if not table.all_frozen():
+            raise RuntimeError(
+                "fp8 KV calibration did not reach every KV layer; refusing to capture CUDA "
+                "graphs with unfrozen scales"
+            )
+        for layer_id, (k_ratio, v_ratio) in sorted(table.clamp_probe().items()):
+            if max(k_ratio, v_ratio) > 1.0:
+                logger.warning_rank0(
+                    f"fp8 KV layer {layer_id}: the checkpoint's scale is too small for observed "
+                    f"activations (k {k_ratio:.2f}x, v {v_ratio:.2f}x of representable range); "
+                    "values will saturate. The checkpoint was calibrated on different data."
+                )
+        calibrated = [
+            f"L{i}:k={table.get(i)[0]:.3e},v={table.get(i)[1]:.3e}"
+            f"{'(ckpt)' if table.is_from_checkpoint(i) else ''}"
+            for i in sorted(table.layer_ids)
+        ]
+        logger.info_rank0(
+            f"fp8 KV scales frozen in {started.elapsed_time(ended) / 1000.0:.3f} s over "
+            f"{length} tokens: {' '.join(calibrated)}"
+        )
 
     @torch.inference_mode()
     def _warmup_prefill(self) -> None:
