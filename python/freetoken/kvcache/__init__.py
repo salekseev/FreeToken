@@ -280,7 +280,19 @@ def create_kvcache_pool(
 
     spec = kv_specs[0] if len(kv_specs) == 1 else None
 
-    from .kv_scale import KVScaleTable
+    # Declared over the GLOBAL ids of the layers that hold paged KV (10 of 40 here) -- the
+    # same ids store_kv and the attention backend pass in. all_frozen() checks that exact
+    # set, so a wrong-key-space bug fails loudly instead of padding the count. Without a
+    # layer remap the pool backs every model layer, so every id is a KV id.
+    kv_scales = None
+    if kv_dtype != dtype:
+        from .kv_scale import KVScaleTable
+
+        kv_scales = KVScaleTable(
+            layer_ids=layer_ids
+            if layer_ids is not None
+            else tuple(range(model_config.num_layers))
+        )
 
     return MHAKVCache(
         num_kv_heads=spec.num_kv_heads if spec is not None else model_config.num_kv_heads,
@@ -294,18 +306,7 @@ def create_kvcache_pool(
         # two can differ, and the attention backend needs both.
         compute_dtype=dtype,
         layer_ids=layer_ids,
-        # Declared over the GLOBAL ids of the layers that hold paged KV (10 of 40 here) --
-        # the same ids store_kv and the attention backend pass in. all_frozen() checks that
-        # exact set, so a wrong-key-space bug fails loudly instead of padding the count.
-        kv_scales=(
-            None
-            if kv_dtype == dtype
-            else KVScaleTable(
-                layer_ids=layer_ids
-                if layer_ids is not None
-                else tuple(range(model_config.num_layers))
-            )
-        ),
+        kv_scales=kv_scales,
     )
 
 
