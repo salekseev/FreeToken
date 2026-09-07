@@ -60,6 +60,10 @@ class EngineConfig:
     cuda_graph_max_bs: int | None = None
     page_size: int = 1
     memory_ratio: float = 0.9
+    # Paged KV cache storage dtype. "auto" = the engine dtype (bf16). "fp8_e4m3" halves the
+    # pool and, on flashinfer's fa2 path, is exact for a per-tensor scale because the kernel
+    # folds the scales (sm_scale *= k_scale, out *= v_scale) instead of dequantizing.
+    kv_cache_dtype: str = "auto"
     # Hybrid GDN models default to the HybridRadixCache (cross-request GDN-state prefix reuse);
     # `--cache-type naive` opts out. linear_state_cache_ratio sizes the GDN snapshot cache as
     # ceil(ratio * max_running_req) extra slots.
@@ -106,3 +110,14 @@ class EngineConfig:
     @property
     def distributed_addr(self) -> str:
         return "tcp://127.0.0.1:2333"
+
+    @property
+    def kv_dtype(self) -> torch.dtype:
+        """Storage dtype for the paged KV slabs. Both KV sizing seams read this off the
+        config rather than taking it as a parameter, so the budget and the allocation can
+        never disagree."""
+        if self.kv_cache_dtype == "auto":
+            return self.dtype
+        if self.kv_cache_dtype == "fp8_e4m3":
+            return torch.float8_e4m3fn
+        raise ValueError(f"unknown --kv-cache-dtype {self.kv_cache_dtype!r}")

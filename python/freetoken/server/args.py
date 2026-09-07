@@ -541,6 +541,16 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--kv-cache-dtype",
+        type=str,
+        default=ServerArgs.kv_cache_dtype,
+        choices=("auto", "fp8_e4m3"),
+        help="Paged KV cache storage dtype. 'auto' keeps the engine dtype. 'fp8_e4m3' halves "
+        "the KV pool using one per-tensor scale per layer; requires an attention backend that "
+        "declares supports_fp8_kv (currently 'fi').",
+    )
+
+    parser.add_argument(
         "--moe-cache-policy",
         default=ServerArgs.moe_cache_policy,
         choices=["lru"],
