@@ -7,6 +7,7 @@ from freetoken.distributed import get_tp_info
 from freetoken.utils import div_even
 
 from .base import BaseKVCachePool
+from .kv_scale import FP8_E4M3_MAX, KVScaleTable
 
 
 class MHAKVCache(BaseKVCachePool):
@@ -32,6 +33,7 @@ class MHAKVCache(BaseKVCachePool):
         dtype: torch.dtype,
         device: torch.device,
         layer_ids: Sequence[int] | None = None,
+        kv_scales: "KVScaleTable | None" = None,
     ) -> None:
         tp_info = get_tp_info()
         local_kv_heads = div_even(num_kv_heads, tp_info.size, allow_replicate=True)
@@ -56,6 +58,12 @@ class MHAKVCache(BaseKVCachePool):
         self._v_buffer = self._kv_buffer[1]
         self._device = device
         self._storage_shape = (num_pages * page_size, local_kv_heads, head_dim)
+        # None restores the unquantized path exactly. When present, store_kv scales-and-casts
+        # into the fp8 slabs and the attention backend passes the same scalars to flashinfer.
+        self._kv_scales = kv_scales
+        # Device-side clamp tally. Accumulated without a sync so the steady-state store path
+        # stays free of host round-trips; read only by the reporting path.
+        self._clamp_count = torch.zeros((), dtype=torch.int64, device=device)
 
     def rebuild(self, num_pages: int) -> None:
         """Reallocate the KV buffer for ``num_pages`` pages IN PLACE.
@@ -146,3 +154,25 @@ class MHAKVCache(BaseKVCachePool):
     @property
     def num_layers(self) -> int:
         return self._num_layers
+
+    def kv_scale(self, layer_id: int) -> tuple[float, float] | None:
+        """This layer's frozen (k_scale, v_scale), or None when the pool is unquantized."""
+        if self._kv_scales is None:
+            return None
+        return self._kv_scales.get(layer_id)
+
+    @property
+    def kv_scales(self) -> "KVScaleTable | None":
+        return self._kv_scales
+
+    def set_checkpoint_scales(self, scales: dict[int, tuple[float, float]]) -> None:
+        """Install checkpoint-calibrated scales, keyed by GLOBAL layer id (same key space
+        the store path and the attention backend use)."""
+        if self._kv_scales is None or not scales:
+            return
+        for layer_id, (k_scale, v_scale) in scales.items():
+            self._kv_scales.set_checkpoint(layer_id, k_scale, v_scale)
+
+    def clamp_count(self) -> int:
+        """Total elements saturated at +/-448 since boot. One host sync; call off the hot path."""
+        return int(self._clamp_count.item())

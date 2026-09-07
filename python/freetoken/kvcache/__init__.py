@@ -89,6 +89,11 @@ def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dt
         # DSV4 is driven by the generic CacheManager over the shared page table; the pool is
         # the only DSV4-specific piece (the swa_pool plug-in: window tier + cmp/idx/state
         # shadows). Sizing reads dsv4_args, never the group spec.
+        if config.kv_dtype != dtype:
+            raise ValueError(
+                f"--kv-cache-dtype fp8_e4m3 is only implemented for the MHA paged pool, not "
+                f"{resolve_pool_class(model_config).__name__}"
+            )
         pool = DSV4PagedKVCache(
             sizes=_dsv4_pool_sizes(config, num_pages + 1),  # +1 for dummy page
             args=model_config.dsv4_args,
@@ -116,6 +121,7 @@ def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dt
         num_swa_tokens=num_swa_tokens,
         device=device,
         dtype=dtype,
+        kv_dtype=config.kv_dtype,
         num_req_slots=config.max_running_req + 1,  # + 1 for the dummy request row
     )
 
@@ -128,7 +134,17 @@ def create_kvcache_pool(
     device: torch.device,
     num_swa_tokens: int | None = None,
     num_req_slots: int | None = None,
+    kv_dtype: torch.dtype | None = None,
 ) -> BaseKVCachePool:
+    # The KV slabs are allocated at kv_dtype; `dtype` remains the engine's compute dtype for
+    # every other tier (state rings, index slabs). None means "same as compute".
+    if kv_dtype is None:
+        kv_dtype = dtype
+    if kv_dtype != dtype and model_config.has_swa_attention:
+        raise ValueError(
+            "--kv-cache-dtype fp8_e4m3 is only implemented for the MHA paged pool; this model "
+            "resolves to the hybrid SWA pool."
+        )
     if model_config.has_swa_attention:
         from .hybrid_swa_pool import HybridSWAKVCache
 
@@ -169,6 +185,11 @@ def create_kvcache_pool(
 
         spec = kv_specs[0]
         assert layer_ids is None, "hybrid-linear x BSA has no pool support yet"
+        if kv_dtype != dtype:
+            raise ValueError(
+                f"--kv-cache-dtype fp8_e4m3 is only implemented for the MHA paged pool, not "
+                f"{resolve_pool_class(model_config).__name__}"
+            )
         return BSAKVCache(
             num_kv_heads=spec.num_kv_heads,
             num_layers=model_config.num_layers,
@@ -191,6 +212,11 @@ def create_kvcache_pool(
         spec = kv_specs[0]
         if num_req_slots is None:
             raise ValueError("QSA pools need num_req_slots (max_running_req + 1)")
+        if kv_dtype != dtype:
+            raise ValueError(
+                f"--kv-cache-dtype fp8_e4m3 is only implemented for the MHA paged pool, not "
+                f"{resolve_pool_class(model_config).__name__}"
+            )
         return QSAKVCache(
             num_kv_heads=spec.num_kv_heads,
             num_layers=model_config.num_layers,
@@ -209,6 +235,11 @@ def create_kvcache_pool(
     if len(kv_specs) == 1 and kv_specs[0].mla:
         from .dsa_pool import DSAKVCache, KpoolDSAKVCache, MLAKVCache
 
+        if kv_dtype != dtype:
+            raise ValueError(
+                f"--kv-cache-dtype fp8_e4m3 is only implemented for the MHA paged pool, not "
+                f"{resolve_pool_class(model_config).__name__}"
+            )
         spec = kv_specs[0]
         # With a layer remap the pool allocates len(layer_ids) slabs; without one
         # it backs every model layer (all-MLA models, GLM-5.2).
@@ -246,6 +277,9 @@ def create_kvcache_pool(
         )
 
     spec = kv_specs[0] if len(kv_specs) == 1 else None
+
+    from .kv_scale import KVScaleTable
+
     return MHAKVCache(
         num_kv_heads=spec.num_kv_heads if spec is not None else model_config.num_kv_heads,
         num_pages=num_pages,
@@ -253,8 +287,20 @@ def create_kvcache_pool(
         num_layers=model_config.num_layers,
         head_dim=spec.head_dim if spec is not None else model_config.head_dim,
         device=device,
-        dtype=dtype,
+        dtype=kv_dtype,
         layer_ids=layer_ids,
+        # Declared over the GLOBAL ids of the layers that hold paged KV (10 of 40 here) --
+        # the same ids store_kv and the attention backend pass in. all_frozen() checks that
+        # exact set, so a wrong-key-space bug fails loudly instead of padding the count.
+        kv_scales=(
+            None
+            if kv_dtype == dtype
+            else KVScaleTable(
+                layer_ids=layer_ids
+                if layer_ids is not None
+                else tuple(range(model_config.num_layers))
+            )
+        ),
     )
 
 
