@@ -399,8 +399,17 @@ def _nvfp4_parts(f, raw_base: str):
 _NOT_DENSE_NVFP4 = object()
 
 
+def _emit_ct_packed_as_bf16(base: str, w, sc, g, bf16_buf: dict):
+    """Dequantize an llm-compressor packed NVFP4 projection to bf16 and route it through the
+    same bf16 fusion the ``.weight`` path uses, for layers the model does NOT keep native."""
+    bf16 = _dequant_nvfp4_weight(w, sc, g[:1])
+    emit = _ct_bf16_fuse(base, bf16, bf16_buf, _PT_BF16_FUSE)
+    return emit if emit is not None else [(base + ".weight", bf16)]
+
+
 def _dense_nvfp4_emit(
-    f, base: str, raw_base: str, *, shared_nvfp4: bool, lmhead_nvfp4: bool, shared_buf: dict
+    f, base: str, raw_base: str, *, shared_nvfp4: bool, lmhead_nvfp4: bool, shared_buf: dict,
+    parts=_nvfp4_parts,
 ):
     """For a dense ``.weight`` whose checkpoint has a ``weight_scale_2`` (NVFP4), return the list
     of ``(key, tensor)`` to yield as native FP4 -- ``(.weight uint8, .weight_scale fp8 block,
@@ -413,19 +422,27 @@ def _dense_nvfp4_emit(
 
     Returns ``[]`` while a gate/up merge is still buffered, or ``_NOT_DENSE_NVFP4`` if the model
     does not keep this layer native (the caller dequantizes to bf16 exactly as before). Shared by
-    the mixed-FP8 dense pass and the default (pure-NVFP4) dense pass."""
+    the mixed-FP8 dense pass and the default (pure-NVFP4) dense pass.
+
+    ``parts`` reads the on-disk NVFP4 triple; it defaults to modelopt's ``_nvfp4_parts``
+    (``.weight`` + ``.weight_scale`` + ``.weight_scale_2``), and callers pass
+    ``_nvfp4_parts_ct`` for llm-compressor (``.weight_packed`` + ``.weight_scale`` +
+    ``.weight_global_scale``). The two are NOT interchangeable: llm-compressor stores the
+    QUANT-side global scale where modelopt stores the DEQUANT-side divisor, so
+    ``_nvfp4_parts_ct`` takes its reciprocal. Reading one convention with the other's reader
+    garbles output rather than raising -- see upstream #390."""
     is_lmhead = base == "lm_head" or base.endswith(".lm_head")
     if lmhead_nvfp4 and is_lmhead:
-        w, s, g = _nvfp4_parts(f, raw_base)
+        w, s, g = parts(f, raw_base)
         return [(base + ".weight", w), (base + ".weight_scale", s), (base + ".weight_global", g)]
     if not shared_nvfp4:
         return _NOT_DENSE_NVFP4
     for gate_b, up_b, down_b, infix in _NVFP4_MLP_LAYOUTS:
         if base.endswith(down_b):
-            w, s, g = _nvfp4_parts(f, raw_base)
+            w, s, g = parts(f, raw_base)
             return [(base + ".weight", w), (base + ".weight_scale", s), (base + ".weight_global", g)]
         if base.endswith(gate_b) or base.endswith(up_b):
-            w, s, g = _nvfp4_parts(f, raw_base)
+            w, s, g = parts(f, raw_base)
             prefix = base.rsplit(infix, 1)[0] + infix
             slots = shared_buf.setdefault(prefix, {})
             slots["gate" if base.endswith(gate_b) else "up"] = (w, s, g)
@@ -487,6 +504,30 @@ def _iter_weights_attn_fp8(
                     continue
                 if _PACKED_EXPERT_PATTERN.match(name) is not None:
                     continue  # no packed experts in this checkpoint; guard anyway
+
+                if name.endswith(".weight_packed"):
+                    # llm-compressor stores dense NVFP4 as ``weight_packed`` with no plain
+                    # ``.weight``, so this projection would otherwise never reach
+                    # _dense_nvfp4_emit and the model would KeyError on the fused
+                    # ``shared_expert.gate_up_proj.weight`` it expects. Routed experts are
+                    # already excluded above (offload cache), so what arrives here is the
+                    # dense side: shared_expert gate/up/down, and lm_head on checkpoints that
+                    # pack it. Uses the CT parts reader for the reciprocal global scale.
+                    base = name[: -len(".weight_packed")]
+                    raw_base = raw_name[: -len(".weight_packed")]
+                    emit = _dense_nvfp4_emit(
+                        f, base, raw_base, shared_nvfp4=dense_nvfp4,
+                        lmhead_nvfp4=lmhead_nvfp4, shared_buf=nvfp4_shared_buf,
+                        parts=_nvfp4_parts_ct,
+                    )
+                    if emit is not _NOT_DENSE_NVFP4:
+                        yield from emit
+                        continue
+                    # Not a layer the model keeps native: dequantize to bf16 like the
+                    # ``.weight`` path below does for its own non-native cases.
+                    w, sc, g = _nvfp4_parts_ct(f, raw_base)
+                    yield from _emit_ct_packed_as_bf16(base, w, sc, g, bf16_buf)
+                    continue
 
                 if name.endswith(".weight"):
                     base = name[: -len(".weight")]
