@@ -149,7 +149,15 @@ def _attn_quant(hf_config: Any) -> str:
         w = g.get("weights") or {}
         if str(w.get("type", "")).lower() != "float" or int(w.get("num_bits", 0) or 0) != 8:
             continue
-        if w.get("group_size") is None and w.get("strategy") == "tensor":
+        # Fp8PerTensorLinear's weight_scale is per output row, so "channel" (one scalar per
+        # row, [N, 1] on disk) and "tensor" (one scalar for the whole weight, stored in every
+        # row) route to the same layer with no kernel work in between.
+        # This is also the ROUTING key: iter_weights dispatches a compressed-tensors MoE
+        # checkpoint to _iter_weights_attn_fp8 on attn_quant == "fp8_pertensor", the only
+        # branch that reads llm-compressor's weight_packed shared expert. Without "channel"
+        # here, a per-channel checkpoint falls through to a path that cannot read its tensors
+        # at all (KeyError on the fused shared_expert.gate_up_proj).
+        if w.get("group_size") is None and w.get("strategy") in ("tensor", "channel"):
             return "fp8_pertensor"
     return "none"
 
