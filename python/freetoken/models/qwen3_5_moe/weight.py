@@ -177,9 +177,16 @@ def iter_weights(
 ) -> Iterator[tuple[str, torch.Tensor]]:
     hf_config = cached_load_hf_config(model_path)
     config = parse_config(hf_config)
-    if _compressed_tensors_nvfp4(hf_config):
+    if _compressed_tensors_nvfp4(hf_config) and config.attn_quant != "fp8_pertensor":
         # Dense compressed-tensors NVFP4 (e.g. Qwen3.6-27B): attn (q/k/v/o, GDN out_proj) +
         # dense MLP are W4A16 NVFP4; GDN in_proj_*, lm_head, norms bf16.
+        #
+        # The attn_quant guard matters: this predicate re-detects from hf_config and claims a
+        # MIXED compressed-tensors checkpoint (fp8 dense + NVFP4 experts) whose attention is
+        # NOT NVFP4 at all. unsloth/Qwen3.6-35B-A3B-NVFP4-Fast lands here and dies in
+        # ct_bf16_fuse with "Promotion for Float8 Types is not supported", because this reader
+        # has no fp8 dense path. Defer to the parsed verdict, which the QuantConfig resolved
+        # per module, instead of re-deciding from the raw config here.
         yield from _iter_weights_compressed_tensors(
             model_path, device,
             include_non_moe=include_non_moe, include_moe_experts=include_moe_experts,
