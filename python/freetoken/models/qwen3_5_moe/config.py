@@ -10,6 +10,84 @@ from freetoken.models.config import (
     detect_compressed_tensors_nvfp4,
 )
 
+from freetoken.layers.quantization import NameMap, QuantConfig, QuantKind
+
+
+# Engine attribute path -> checkpoint module name(s), for every ``scheme_for`` query.
+# The engine fuses projections the checkpoint stores separately, so a fused prefix has to
+# expand to its sources or the scheme cannot be resolved. Mirrors ``_PT_FP8_FUSE`` /
+# ``_PT_BF16_FUSE`` / ``_NVFP4_MLP_LAYOUTS`` in weight.py.
+_PACKED = (
+    ("qkv_proj", ("q_proj", "k_proj", "v_proj")),
+    ("gate_up_proj", ("gate_proj", "up_proj")),
+    ("in_proj_qkvz", ("in_proj_qkv", "in_proj_z")),
+    ("in_proj_ba", ("in_proj_b", "in_proj_a")),
+)
+
+
+def _uses_language_model_prefix(hf_config: Any) -> bool:
+    """Whether the checkpoint names its text tower ``model.language_model.*``.
+
+    ``_rename`` strips that prefix on the way in, so engine paths are always ``model.*``;
+    a scheme lookup has to put it back or every per-module query misses. ModelOpt exports
+    name modules literally and do use it; llm-compressor exports use ``re:`` targets that
+    match either way. See upstream #381."""
+    get = _quant_accessor(hf_config)
+    if get is None:
+        return False
+    names: list[str] = list((get("quantized_layers") or {}).keys())
+    for g in (get("config_groups") or {}).values():
+        names += list((g or {}).get("targets") or [])
+    names += list(get("ignore") or get("modules_to_not_convert") or [])
+    return any("model.language_model." in str(n) for n in names)
+
+
+def _quant_config(hf_config: Any) -> QuantConfig | None:
+    """The checkpoint's ``QuantConfig``, or ``None`` when its dialect is not in
+    ``layers/quantization`` yet.
+
+    AWQ and compressed-tensors *int4* both raise ``NotImplementedError`` there today, and
+    this family serves three such checkpoints, so a missing dialect must fall back to the
+    legacy per-model detectors rather than fail the load. See upstream #396."""
+    try:
+        return QuantConfig.from_hf(
+            hf_config, name_map=NameMap(
+                roots=(("model", "model.language_model"),) if _uses_language_model_prefix(hf_config) else (),
+                packed=_PACKED,
+            ),
+        )
+    except NotImplementedError:
+        return None
+
+
+# QuantKind -> the verdict strings the engine and the weight readers still switch on.
+_ATTN_KIND = {QuantKind.FP8_TENSOR: "fp8_pertensor", QuantKind.NVFP4: "nvfp4"}
+_EXPERT_KIND = {QuantKind.NVFP4: "nvfp4", QuantKind.FP8_BLOCK: "fp8_block",
+                QuantKind.MXFP4: "mxfp4"}
+
+
+def _kind_of(quant: QuantConfig, prefix: str):
+    """``scheme_for`` but tolerant: a fused prefix whose sources disagree, or a name the
+    dialect does not describe, reads as unquantized rather than raising during config parse."""
+    try:
+        scheme = quant.scheme_for(prefix)
+    except (ValueError, KeyError, NotImplementedError):
+        return None
+    return scheme.kind if scheme else None
+
+
+def _kind_over_layers(quant: QuantConfig, ids, template: str):
+    """First quantized kind across ``ids``, or None if every one is unquantized.
+
+    Probing a single layer is not safe: exports routinely carve individual layers out via
+    ``ignore`` -- primitive-ai/Ornith-1.5-35B-A3B-mixed-NVFP4-FP8 excludes layer 0's experts
+    while quantizing the rest, so a layer-0 probe reads the whole family as bf16."""
+    for i in ids:
+        kind = _kind_of(quant, template.format(i=i))
+        if kind is not None:
+            return kind
+    return None
+
 
 def _quant_accessor(hf_config: Any):
     """A ``get(key, default=None)`` accessor over the HF ``quantization_config`` (dict or
@@ -164,6 +242,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
         else {k: v for k, v in rope_params.items() if not isinstance(v, (list, dict))}
     )
 
+    quant = _quant_config(hf_config)
     expert_quant, weight_block_size = _fp8_block_quant(hf_config)
     if expert_quant == "none":
         expert_quant = _expert_quant(hf_config)  # nvfp4 / mixed-precision modelopt
@@ -195,6 +274,47 @@ def parse_config(hf_config: Any) -> ModelConfig:
     layer_types = _layer_types(text)
     full_ids = tuple(i for i, t in enumerate(layer_types) if t == "full_attention")
     linear_ids = tuple(i for i, t in enumerate(layer_types) if t == "linear_attention")
+
+    # Prefer the shared quantization layer over the hand-rolled detectors above. It reads the
+    # same checkpoints more completely -- per-channel fp8 (FP8_CHANNEL), class-name ``targets``,
+    # and ``ignore`` taking precedence over a group's targets, which the detectors get wrong --
+    # and every module already takes its own scheme from ``ModelConfig.quant`` when it is built.
+    # The verdict strings stay because the engine still switches on them: engine.py reads
+    # expert_quant for its MoE-strategy and bench-format decisions and attn_quant/dense_quant
+    # for kernel selection, and checkpoint/convert.py hashes expert_quant.
+    #
+    # ``quant is None`` means the dialect is missing (AWQ, compressed-tensors int4), in which
+    # case the legacy verdicts computed above stand unchanged.
+    if quant is not None and expert_quant != "fp8_block":
+        all_ids = tuple(range(len(layer_types)))
+        expert_kind = _kind_over_layers(quant, all_ids, "model.layers.{i}.mlp.experts.0.gate_proj")
+        # The dense side follows the shared expert on MoE, the bare MLP on a dense variant.
+        dense_kind = (_kind_over_layers(quant, all_ids, "model.layers.{i}.mlp.shared_expert.gate_proj")
+                      or _kind_over_layers(quant, all_ids, "model.layers.{i}.mlp.gate_proj"))
+        attn_kind = (_kind_over_layers(quant, full_ids, "model.layers.{i}.self_attn.q_proj")
+                     or _kind_over_layers(quant, linear_ids, "model.layers.{i}.linear_attn.in_proj_qkv"))
+        lm_head_kind = _kind_of(quant, "lm_head")
+
+        # NEVER DOWNGRADE. A scheme verdict replaces a legacy one, but "none" from the scheme
+        # layer does not overrule a legacy detector that found something -- otherwise a
+        # checkpoint that loads today silently becomes bf16 and stops fitting.
+        #
+        # This is not hypothetical. primitive-ai/Ornith-1.5-35B-A3B-mixed-NVFP4-FP8 lists all
+        # 10,240 routed-expert modules (40 layers x 256) in ``ignore`` as bare parents
+        # (``...layers.N.mlp.experts.M``) while ALSO regex-targeting their projections in its
+        # NVFP4 group. ``ignore`` wins and matches parents by design (see names.py::name_set),
+        # so the scheme layer reads those experts as unquantized -- but they are NVFP4 on disk,
+        # and the legacy detector's answer is the one that matches the tensors. Until that
+        # precedence is settled upstream, keep the answer that loads.
+        def _keep(new_verdict: str, legacy: str) -> str:
+            return legacy if new_verdict == "none" and legacy != "none" else new_verdict
+
+        expert_quant = _keep(_EXPERT_KIND.get(expert_kind, "none"), expert_quant)
+        attn_quant = _keep(_ATTN_KIND.get(attn_kind, "none"), attn_quant)
+        dense_quant = _keep("nvfp4" if dense_kind is QuantKind.NVFP4 else "none", dense_quant)
+        # Only NVFP4 needs the reader to emit a native head; an fp8 head is served by the
+        # Fp8TensorLinearMethod that ParallelLMHead builds from ``quant`` itself.
+        lm_head_quant = _keep("nvfp4" if lm_head_kind is QuantKind.NVFP4 else "none", lm_head_quant)
 
     full_rotary = RotaryConfig(
         head_dim=head_dim,
@@ -252,6 +372,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
         vision_config=None,  # text-only milestone
         image_token_id=getattr(hf_config, "image_token_id", None),
         attention_groups=groups,
+        quant=quant,
         expert_quant=expert_quant,
         weight_block_size=weight_block_size,
         attn_quant=attn_quant,
